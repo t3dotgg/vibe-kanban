@@ -199,5 +199,16 @@
     "createFirstPrompt": "请先创建项目以开始处理任务。",
     "createNew": "创建新项目",
     "noProjectsFound": "未找到项目"
+  },
+  "logs": {
+    "searchLogs": "搜索日志",
+    "selectProcessToView": "选择一个进程以查看日志"
+  },
+  "processes": {
+    "noProcesses": "无进程"
+  },
+  "search": {
+    "matchCount": "{{current}} / {{total}}",
+    "noMatches": "无匹配项"
   }
 }

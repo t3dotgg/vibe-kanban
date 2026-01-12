@@ -199,5 +199,16 @@
     "createFirstPrompt": "Crea un proyecto primero para comenzar a trabajar en tareas.",
     "createNew": "Crear nuevo proyecto",
     "noProjectsFound": "No se encontraron proyectos"
+  },
+  "logs": {
+    "searchLogs": "Buscar registros",
+    "selectProcessToView": "Seleccione un proceso para ver los registros"
+  },
+  "processes": {
+    "noProcesses": "Sin procesos"
+  },
+  "search": {
+    "matchCount": "{{current}} de {{total}}",
+    "noMatches": "Sin coincidencias"
   }
 }

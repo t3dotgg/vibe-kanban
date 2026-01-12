@@ -199,5 +199,16 @@
     "createFirstPrompt": "작업을 시작하려면 먼저 프로젝트를 만드세요.",
     "createNew": "새 프로젝트 만들기",
     "noProjectsFound": "프로젝트를 찾을 수 없습니다"
+  },
+  "logs": {
+    "searchLogs": "로그 검색",
+    "selectProcessToView": "로그를 보려면 프로세스를 선택하세요"
+  },
+  "processes": {
+    "noProcesses": "프로세스 없음"
+  },
+  "search": {
+    "matchCount": "{{current}} / {{total}}",
+    "noMatches": "일치 항목 없음"
   }
 }

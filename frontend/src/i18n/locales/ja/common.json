@@ -199,5 +199,16 @@
     "createFirstPrompt": "タスクを開始するには、まずプロジェクトを作成してください。",
     "createNew": "新しいプロジェクトを作成",
     "noProjectsFound": "プロジェクトが見つかりません"
+  },
+  "logs": {
+    "searchLogs": "ログを検索",
+    "selectProcessToView": "プロセスを選択してログを表示"
+  },
+  "processes": {
+    "noProcesses": "プロセスがありません"
+  },
+  "search": {
+    "matchCount": "{{current}} / {{total}}",
+    "noMatches": "一致なし"
   }
 }

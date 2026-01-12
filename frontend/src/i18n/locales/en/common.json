@@ -199,5 +199,16 @@
     "createFirstPrompt": "Create a project first to start working on tasks.",
     "createNew": "Create new project",
     "noProjectsFound": "No projects found"
+  },
+  "logs": {
+    "searchLogs": "Search logs",
+    "selectProcessToView": "Select a process to view logs"
+  },
+  "processes": {
+    "noProcesses": "No processes"
+  },
+  "search": {
+    "matchCount": "{{current}} of {{total}}",
+    "noMatches": "No matches"
   }
 }
