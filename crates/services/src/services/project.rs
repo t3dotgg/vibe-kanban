@@ -7,7 +7,6 @@ use db::models::{
     project::{CreateProject, Project, ProjectError, SearchMatchType, SearchResult, UpdateProject},
     project_repo::{CreateProjectRepo, ProjectRepo},
     repo::Repo,
-    task::Task,
 };
 use ignore::WalkBuilder;
 use sqlx::SqlitePool;
@@ -19,7 +18,6 @@ use super::{
     file_ranker::FileRanker,
     file_search_cache::{CacheError, FileSearchCache, SearchMode, SearchQuery},
     repo::{RepoError, RepoService},
-    share::ShareError,
 };
 
 #[derive(Debug, Error)]
@@ -30,8 +28,6 @@ pub enum ProjectServiceError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Project(#[from] ProjectError),
-    #[error(transparent)]
-    Share(#[from] ShareError),
     #[error("Path does not exist: {0}")]
     PathNotFound(PathBuf),
     #[error("Path is not a directory: {0}")]
@@ -152,13 +148,8 @@ impl ProjectService {
         pool: &SqlitePool,
         project: &Project,
     ) -> Result<Project> {
-        if let Some(remote_project_id) = project.remote_project_id {
-            let mut tx = pool.begin().await?;
-
-            Task::clear_shared_task_ids_for_remote_project(&mut *tx, remote_project_id).await?;
-            Project::set_remote_project_id_tx(&mut *tx, project.id, None).await?;
-
-            tx.commit().await?;
+        if project.remote_project_id.is_some() {
+            Project::set_remote_project_id(pool, project.id, None).await?;
         }
 
         let updated = Project::find_by_id(pool, project.id)
