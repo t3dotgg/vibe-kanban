@@ -58,6 +58,27 @@ use crate::services::{
     worktree_manager::WorktreeError,
 };
 pub type ContainerRef = String;
+pub type NormalizedLogsCache = Arc<RwLock<HashMap<Uuid, Arc<Vec<LogMsg>>>>>;
+
+const NORMALIZED_LOGS_CACHE_MAX_ENTRIES: usize = 64;
+
+fn normalized_logs_stream(
+    logs: Arc<Vec<LogMsg>>,
+) -> futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>> {
+    let stream = futures::stream::unfold((logs, 0_usize), |(logs, idx)| async move {
+        if idx >= logs.len() {
+            None
+        } else {
+            Some((Ok::<_, std::io::Error>(logs[idx].clone()), (logs, idx + 1)))
+        }
+    });
+
+    stream
+        .chain(futures::stream::once(async {
+            Ok::<_, std::io::Error>(LogMsg::Finished)
+        }))
+        .boxed()
+}
 
 #[derive(Debug, Error)]
 pub enum ContainerError {
@@ -86,6 +107,7 @@ pub enum ContainerError {
 #[async_trait]
 pub trait ContainerService {
     fn msg_stores(&self) -> &Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>;
+    fn normalized_logs_cache(&self) -> &NormalizedLogsCache;
 
     fn db(&self) -> &DBService;
 
@@ -561,6 +583,39 @@ pub trait ContainerService {
         map.get(uuid).cloned()
     }
 
+    async fn get_cached_normalized_logs(&self, uuid: &Uuid) -> Option<Arc<Vec<LogMsg>>> {
+        let cache = self.normalized_logs_cache().read().await;
+        cache.get(uuid).cloned()
+    }
+
+    async fn set_cached_normalized_logs(&self, uuid: Uuid, logs: Arc<Vec<LogMsg>>) {
+        let mut cache = self.normalized_logs_cache().write().await;
+        if cache.len() >= NORMALIZED_LOGS_CACHE_MAX_ENTRIES {
+            if let Some(first_key) = cache.keys().next().cloned() {
+                cache.remove(&first_key);
+            }
+        }
+        cache.insert(uuid, logs);
+    }
+
+    async fn collect_normalized_logs(&self, store: Arc<MsgStore>) -> Arc<Vec<LogMsg>> {
+        let mut entries = Vec::new();
+        let mut stream = store
+            .history_plus_stream()
+            .filter(|msg| future::ready(matches!(msg, Ok(LogMsg::JsonPatch(..)))))
+            .boxed();
+
+        drop(store);
+
+        while let Some(item) = stream.next().await {
+            if let Ok(msg @ LogMsg::JsonPatch(_)) = item {
+                entries.push(msg);
+            }
+        }
+
+        Arc::new(entries)
+    }
+
     async fn git_branch_prefix(&self) -> String;
 
     async fn git_branch_from_workspace(&self, workspace_id: &Uuid, task_title: &str) -> String {
@@ -641,6 +696,10 @@ pub trait ContainerService {
                     .boxed(),
             )
         } else {
+            if let Some(cached_logs) = self.get_cached_normalized_logs(id).await {
+                return Some(normalized_logs_stream(cached_logs));
+            }
+
             // Fallback: load from DB and normalize
             let log_records =
                 match ExecutionProcessLogs::find_by_execution_id(&self.db().pool, *id).await {
@@ -785,15 +844,11 @@ pub trait ContainerService {
                     return None;
                 }
             }
-            Some(
-                temp_store
-                    .history_plus_stream()
-                    .filter(|msg| future::ready(matches!(msg, Ok(LogMsg::JsonPatch(..)))))
-                    .chain(futures::stream::once(async {
-                        Ok::<_, std::io::Error>(LogMsg::Finished)
-                    }))
-                    .boxed(),
-            )
+            let cached_logs = self.collect_normalized_logs(temp_store).await;
+            self.set_cached_normalized_logs(*id, cached_logs.clone())
+                .await;
+
+            Some(normalized_logs_stream(cached_logs))
         }
     }
 

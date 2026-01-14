@@ -44,7 +44,7 @@ use services::services::{
     analytics::AnalyticsContext,
     approvals::{Approvals, executor_approvals::ExecutorApprovalBridge},
     config::Config,
-    container::{ContainerError, ContainerRef, ContainerService},
+    container::{ContainerError, ContainerRef, ContainerService, NormalizedLogsCache},
     diff_stream::{self, DiffStreamHandle},
     git::{GitCli, GitService},
     image::ImageService,
@@ -70,6 +70,7 @@ pub struct LocalContainerService {
     child_store: Arc<RwLock<HashMap<Uuid, Arc<RwLock<AsyncGroupChild>>>>>,
     interrupt_senders: Arc<RwLock<HashMap<Uuid, InterruptSender>>>,
     msg_stores: Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>,
+    normalized_logs_cache: NormalizedLogsCache,
     config: Arc<RwLock<Config>>,
     git: GitService,
     image_service: ImageService,
@@ -95,6 +96,7 @@ impl LocalContainerService {
     ) -> Self {
         let child_store = Arc::new(RwLock::new(HashMap::new()));
         let interrupt_senders = Arc::new(RwLock::new(HashMap::new()));
+        let normalized_logs_cache = Arc::new(RwLock::new(HashMap::new()));
         let notification_service = NotificationService::new(config.clone());
 
         let container = LocalContainerService {
@@ -102,6 +104,7 @@ impl LocalContainerService {
             child_store,
             interrupt_senders,
             msg_stores,
+            normalized_logs_cache,
             config,
             git,
             image_service,
@@ -882,6 +885,10 @@ fn failure_exit_status() -> std::process::ExitStatus {
 impl ContainerService for LocalContainerService {
     fn msg_stores(&self) -> &Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>> {
         &self.msg_stores
+    }
+
+    fn normalized_logs_cache(&self) -> &NormalizedLogsCache {
+        &self.normalized_logs_cache
     }
 
     fn db(&self) -> &DBService {

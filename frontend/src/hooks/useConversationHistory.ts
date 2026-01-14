@@ -47,8 +47,7 @@ interface UseConversationHistoryParams {
 
 interface UseConversationHistoryResult {}
 
-const MIN_INITIAL_ENTRIES = 10;
-const REMAINING_BATCH_SIZE = 50;
+const HISTORIC_LOAD_CONCURRENCY = 4;
 
 const makeLoadingPatch = (executionProcessId: string): PatchTypeWithKey => ({
   type: 'NORMALIZED_ENTRY',
@@ -168,28 +167,6 @@ export const useConversationHistory = ({
       patchKey: `${executionProcessId}:${index}`,
       executionProcessId,
     };
-  };
-
-  const flattenEntries = (
-    executionProcessState: ExecutionProcessStateStore
-  ): PatchTypeWithKey[] => {
-    return Object.values(executionProcessState)
-      .filter(
-        (p) =>
-          p.executionProcess.executor_action.typ.type ===
-            'CodingAgentFollowUpRequest' ||
-          p.executionProcess.executor_action.typ.type ===
-            'CodingAgentInitialRequest' ||
-          p.executionProcess.executor_action.typ.type === 'ReviewRequest'
-      )
-      .sort(
-        (a, b) =>
-          new Date(
-            a.executionProcess.created_at as unknown as string
-          ).getTime() -
-          new Date(b.executionProcess.created_at as unknown as string).getTime()
-      )
-      .flatMap((p) => p.entries);
   };
 
   const getActiveAgentProcesses = (): ExecutionProcess[] => {
@@ -424,6 +401,10 @@ export const useConversationHistory = ({
       addEntryType: AddEntryType,
       loading: boolean
     ) => {
+      if (!loadedInitialEntries.current && addEntryType !== 'initial') {
+        return;
+      }
+
       const entries = flattenEntriesForEmit(executionProcessState);
       let modifiedAddEntryType = addEntryType;
 
@@ -497,17 +478,22 @@ export const useConversationHistory = ({
     [loadRunningAndEmit]
   );
 
-  const loadInitialEntries =
-    useCallback(async (): Promise<ExecutionProcessStateStore> => {
-      const localDisplayedExecutionProcesses: ExecutionProcessStateStore = {};
+  const loadAllHistoricEntries = useCallback(async () => {
+    const localDisplayedExecutionProcesses: ExecutionProcessStateStore = {};
 
-      if (!executionProcesses?.current) return localDisplayedExecutionProcesses;
+    if (!executionProcesses?.current) return localDisplayedExecutionProcesses;
 
-      for (const executionProcess of [
-        ...executionProcesses.current,
-      ].reverse()) {
-        if (executionProcess.status === ExecutionProcessStatus.running)
-          continue;
+    const historicProcesses = executionProcesses.current.filter(
+      (executionProcess) =>
+        executionProcess.status !== ExecutionProcessStatus.running
+    );
+
+    const queue = [...historicProcesses];
+    const concurrentLoads = Math.min(HISTORIC_LOAD_CONCURRENCY, queue.length);
+    const workers = Array.from({ length: concurrentLoads }, async () => {
+      while (queue.length > 0) {
+        const executionProcess = queue.pop();
+        if (!executionProcess) return;
 
         const entries =
           await loadEntriesForHistoricExecutionProcess(executionProcess);
@@ -519,58 +505,13 @@ export const useConversationHistory = ({
           executionProcess,
           entries: entriesWithKey,
         };
-
-        if (
-          flattenEntries(localDisplayedExecutionProcesses).length >
-          MIN_INITIAL_ENTRIES
-        ) {
-          break;
-        }
       }
+    });
 
-      return localDisplayedExecutionProcesses;
-    }, [executionProcesses]);
+    await Promise.all(workers);
 
-  const loadRemainingEntriesInBatches = useCallback(
-    async (batchSize: number): Promise<boolean> => {
-      if (!executionProcesses?.current) return false;
-
-      let anyUpdated = false;
-      for (const executionProcess of [
-        ...executionProcesses.current,
-      ].reverse()) {
-        const current = displayedExecutionProcesses.current;
-        if (
-          current[executionProcess.id] ||
-          executionProcess.status === ExecutionProcessStatus.running
-        )
-          continue;
-
-        const entries =
-          await loadEntriesForHistoricExecutionProcess(executionProcess);
-        const entriesWithKey = entries.map((e, idx) =>
-          patchWithKey(e, executionProcess.id, idx)
-        );
-
-        mergeIntoDisplayed((state) => {
-          state[executionProcess.id] = {
-            executionProcess,
-            entries: entriesWithKey,
-          };
-        });
-
-        if (
-          flattenEntries(displayedExecutionProcesses.current).length > batchSize
-        ) {
-          anyUpdated = true;
-          break;
-        }
-        anyUpdated = true;
-      }
-      return anyUpdated;
-    },
-    [executionProcesses]
-  );
+    return localDisplayedExecutionProcesses;
+  }, [executionProcesses]);
 
   const ensureProcessVisible = useCallback((p: ExecutionProcess) => {
     mergeIntoDisplayed((state) => {
@@ -610,23 +551,13 @@ export const useConversationHistory = ({
         return;
 
       // Initial entries
-      const allInitialEntries = await loadInitialEntries();
+      const allInitialEntries = await loadAllHistoricEntries();
       if (cancelled) return;
       mergeIntoDisplayed((state) => {
         Object.assign(state, allInitialEntries);
       });
       emitEntries(displayedExecutionProcesses.current, 'initial', false);
       loadedInitialEntries.current = true;
-
-      // Then load the remaining in batches
-      while (
-        !cancelled &&
-        (await loadRemainingEntriesInBatches(REMAINING_BATCH_SIZE))
-      ) {
-        if (cancelled) return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      emitEntries(displayedExecutionProcesses.current, 'historic', false);
     })();
     return () => {
       cancelled = true;
@@ -634,8 +565,7 @@ export const useConversationHistory = ({
   }, [
     attempt.id,
     idListKey,
-    loadInitialEntries,
-    loadRemainingEntriesInBatches,
+    loadAllHistoricEntries,
     emitEntries,
   ]); // include idListKey so new processes trigger reload
 
@@ -645,16 +575,18 @@ export const useConversationHistory = ({
 
     for (const activeProcess of activeProcesses) {
       if (!displayedExecutionProcesses.current[activeProcess.id]) {
-        const runningOrInitial =
-          Object.keys(displayedExecutionProcesses.current).length > 1
-            ? 'running'
-            : 'initial';
         ensureProcessVisible(activeProcess);
-        emitEntries(
-          displayedExecutionProcesses.current,
-          runningOrInitial,
-          false
-        );
+        if (loadedInitialEntries.current) {
+          const runningOrInitial =
+            Object.keys(displayedExecutionProcesses.current).length > 1
+              ? 'running'
+              : 'initial';
+          emitEntries(
+            displayedExecutionProcesses.current,
+            runningOrInitial,
+            false
+          );
+        }
       }
 
       if (
