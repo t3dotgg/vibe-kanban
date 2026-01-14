@@ -11,7 +11,8 @@ use axum::{
     routing::{get, post},
 };
 use db::models::{
-    execution_process::{ExecutionProcess, ExecutionProcessRunReason},
+    execution_process::{ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus},
+    execution_process_logs::ExecutionProcessLogs,
     scratch::{Scratch, ScratchType},
     session::{CreateSession, Session},
     workspace::{Workspace, WorkspaceError},
@@ -23,8 +24,12 @@ use executors::{
         ExecutorAction, ExecutorActionType, coding_agent_follow_up::CodingAgentFollowUpRequest,
     },
     executors::BaseCodingAgent,
+    logs::utils::patch::PatchType,
     profile::ExecutorProfileId,
 };
+use json_patch::patch as apply_patch;
+use serde::Serialize;
+use serde_json::json;
 use serde::Deserialize;
 use services::services::container::ContainerService;
 use ts_rs::TS;
@@ -60,6 +65,49 @@ pub async fn get_session(
     Extension(session): Extension<Session>,
 ) -> Result<ResponseJson<ApiResponse<Session>>, ApiError> {
     Ok(ResponseJson(ApiResponse::success(session)))
+}
+
+#[derive(Serialize)]
+pub struct ConversationProcessEntries {
+    pub execution_process: ExecutionProcess,
+    pub entries: Vec<PatchType>,
+}
+
+#[derive(Serialize)]
+pub struct SessionConversationResponse {
+    pub processes: Vec<ConversationProcessEntries>,
+}
+
+pub async fn get_session_conversation(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<SessionConversationResponse>>, ApiError> {
+    let pool = &deployment.db().pool;
+    let execution_processes =
+        ExecutionProcess::find_by_session_id(pool, session.id, false).await?;
+
+    let mut processes = Vec::new();
+    for execution_process in execution_processes {
+        if !matches!(
+            execution_process.run_reason,
+            ExecutionProcessRunReason::SetupScript
+                | ExecutionProcessRunReason::CleanupScript
+                | ExecutionProcessRunReason::CodingAgent
+        ) {
+            continue;
+        }
+
+        let entries = load_entries_for_process(&deployment, &execution_process).await?;
+
+        processes.push(ConversationProcessEntries {
+            execution_process,
+            entries,
+        });
+    }
+
+    Ok(ResponseJson(ApiResponse::success(SessionConversationResponse {
+        processes,
+    })))
 }
 
 pub async fn create_session(
@@ -236,9 +284,147 @@ pub async fn follow_up(
     Ok(ResponseJson(ApiResponse::success(execution_process)))
 }
 
+async fn load_entries_for_process(
+    deployment: &DeploymentImpl,
+    process: &ExecutionProcess,
+) -> Result<Vec<PatchType>, ApiError> {
+    let executor_action = match process.executor_action() {
+        Ok(action) => action,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to parse executor action for execution {}: {}",
+                process.id,
+                err
+            );
+            return Ok(Vec::new());
+        }
+    };
+    let is_script = matches!(executor_action.typ(), ExecutorActionType::ScriptRequest(_));
+
+    if is_script {
+        Ok(load_raw_entries(deployment, process).await)
+    } else {
+        Ok(load_normalized_entries(deployment, process).await?)
+    }
+}
+
+async fn load_raw_entries(
+    deployment: &DeploymentImpl,
+    process: &ExecutionProcess,
+) -> Vec<PatchType> {
+    if process.status == ExecutionProcessStatus::Running {
+        if let Some(store) = deployment.container().get_msg_store_by_id(&process.id).await {
+            return store
+                .get_history()
+                .into_iter()
+                .filter_map(|msg| match msg {
+                    utils::log_msg::LogMsg::Stdout(content) => {
+                        Some(PatchType::Stdout(content))
+                    }
+                    utils::log_msg::LogMsg::Stderr(content) => {
+                        Some(PatchType::Stderr(content))
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+
+    let log_records =
+        match ExecutionProcessLogs::find_by_execution_id(&deployment.db().pool, process.id).await {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to fetch logs for execution {}: {}",
+                    process.id,
+                    err
+                );
+                return Vec::new();
+            }
+        };
+
+    let raw_messages = match ExecutionProcessLogs::parse_logs(&log_records) {
+        Ok(msgs) => msgs,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to parse logs for execution {}: {}",
+                process.id,
+                err
+            );
+            return Vec::new();
+        }
+    };
+
+    raw_messages
+        .into_iter()
+        .filter_map(|msg| match msg {
+            utils::log_msg::LogMsg::Stdout(content) => Some(PatchType::Stdout(content)),
+            utils::log_msg::LogMsg::Stderr(content) => Some(PatchType::Stderr(content)),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn load_normalized_entries(
+    deployment: &DeploymentImpl,
+    process: &ExecutionProcess,
+) -> Result<Vec<PatchType>, ApiError> {
+    let mut doc = json!({ "entries": [] });
+
+    if process.status == ExecutionProcessStatus::Running {
+        if let Some(store) = deployment.container().get_msg_store_by_id(&process.id).await {
+            let patches = store
+                .get_history()
+                .into_iter()
+                .filter_map(|msg| match msg {
+                    utils::log_msg::LogMsg::JsonPatch(patch) => Some(patch),
+                    _ => None,
+                });
+
+            for patch in patches {
+                if let Err(err) = apply_patch(&mut doc, &patch) {
+                    tracing::warn!(
+                        "Failed to apply normalized patch for execution {}: {}",
+                        process.id,
+                        err
+                    );
+                }
+            }
+
+            let entries_value = doc.get("entries").cloned().unwrap_or_default();
+            return Ok(serde_json::from_value(entries_value).unwrap_or_default());
+        }
+    }
+
+    let normalized_logs = match deployment
+        .container()
+        .get_normalized_log_messages(&process.id)
+        .await
+    {
+        Some(logs) => logs,
+        None => return Ok(Vec::new()),
+    };
+
+    for msg in normalized_logs.iter() {
+        if let utils::log_msg::LogMsg::JsonPatch(patch) = msg {
+            if let Err(err) = apply_patch(&mut doc, patch) {
+                tracing::warn!(
+                    "Failed to apply normalized patch for execution {}: {}",
+                    process.id,
+                    err
+                );
+            }
+        }
+    }
+
+    let entries_value = doc.get("entries").cloned().unwrap_or_default();
+    Ok(serde_json::from_value(entries_value).unwrap_or_default())
+}
+
 pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     let session_id_router = Router::new()
         .route("/", get(get_session))
+        .route("/conversation", get(get_session_conversation))
         .route("/follow-up", post(follow_up))
         .route("/review", post(review::start_review))
         .layer(from_fn_with_state(

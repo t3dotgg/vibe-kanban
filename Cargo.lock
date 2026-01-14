@@ -4743,6 +4743,7 @@ dependencies = [
  "futures-util",
  "git2",
  "ignore",
+ "json-patch",
  "local-deployment",
  "mime_guess",
  "nix 0.29.0",

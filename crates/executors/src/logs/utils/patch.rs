@@ -17,7 +17,7 @@ enum PatchOperation {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Serialize, TS)]
+#[derive(Serialize, Deserialize, TS)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "type", content = "content")]
 pub enum PatchType {
     NormalizedEntry(NormalizedEntry),

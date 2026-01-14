@@ -15,6 +15,7 @@ import {
   DirectoryEntry,
   ExecutionProcess,
   ExecutionProcessRepoState,
+  PatchType,
   GitBranch,
   Project,
   Repo,
@@ -444,6 +445,15 @@ export const tasksApi = {
   },
 };
 
+export type SessionConversationProcess = {
+  execution_process: ExecutionProcess;
+  entries: PatchType[];
+};
+
+export type SessionConversationResponse = {
+  processes: SessionConversationProcess[];
+};
+
 // Sessions API
 export const sessionsApi = {
   getByWorkspace: async (workspaceId: string): Promise<Session[]> => {
@@ -489,6 +499,15 @@ export const sessionsApi = {
       body: JSON.stringify(data),
     });
     return handleApiResponse<ExecutionProcess, ReviewError>(response);
+  },
+
+  getConversation: async (
+    sessionId: string
+  ): Promise<SessionConversationResponse> => {
+    const response = await makeRequest(
+      `/api/sessions/${sessionId}/conversation`
+    );
+    return handleApiResponse<SessionConversationResponse>(response);
   },
 };
 

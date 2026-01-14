@@ -7,10 +7,11 @@ import {
   NormalizedEntry,
   PatchType,
   ToolStatus,
-  Workspace,
 } from 'shared/types';
 import { useExecutionProcessesContext } from '@/contexts/ExecutionProcessesContext';
 import { useCallback, useEffect, useMemo, useRef } from 'react';
+import type { WorkspaceWithSession } from '@/types/attempt';
+import { sessionsApi } from '@/lib/api';
 import { streamJsonPatchEntries } from '@/utils/streamJsonPatchEntries';
 
 export type PatchTypeWithKey = PatchType & {
@@ -41,13 +42,11 @@ type ExecutionProcessState = {
 type ExecutionProcessStateStore = Record<string, ExecutionProcessState>;
 
 interface UseConversationHistoryParams {
-  attempt: Workspace;
+  attempt: WorkspaceWithSession;
   onEntriesUpdated: OnEntriesUpdated;
 }
 
 interface UseConversationHistoryResult {}
-
-const HISTORIC_LOAD_CONCURRENCY = 4;
 
 const makeLoadingPatch = (executionProcessId: string): PatchTypeWithKey => ({
   type: 'NORMALIZED_ENTRY',
@@ -100,6 +99,7 @@ export const useConversationHistory = ({
   const loadedInitialEntries = useRef(false);
   const streamingProcessIdsRef = useRef<Set<string>>(new Set());
   const onEntriesUpdatedRef = useRef<OnEntriesUpdated | null>(null);
+  const sessionId = attempt.session?.id;
 
   const mergeIntoDisplayed = (
     mutator: (state: ExecutionProcessStateStore) => void
@@ -120,34 +120,6 @@ export const useConversationHistory = ({
         ep.run_reason === 'codingagent'
     );
   }, [executionProcessesRaw]);
-
-  const loadEntriesForHistoricExecutionProcess = (
-    executionProcess: ExecutionProcess
-  ) => {
-    let url = '';
-    if (executionProcess.executor_action.typ.type === 'ScriptRequest') {
-      url = `/api/execution-processes/${executionProcess.id}/raw-logs/ws`;
-    } else {
-      url = `/api/execution-processes/${executionProcess.id}/normalized-logs/ws`;
-    }
-
-    return new Promise<PatchType[]>((resolve) => {
-      const controller = streamJsonPatchEntries<PatchType>(url, {
-        onFinished: (allEntries) => {
-          controller.close();
-          resolve(allEntries);
-        },
-        onError: (err) => {
-          console.warn!(
-            `Error loading entries for historic execution process ${executionProcess.id}`,
-            err
-          );
-          controller.close();
-          resolve([]);
-        },
-      });
-    });
-  };
 
   const getLiveExecutionProcess = (
     executionProcessId: string
@@ -437,6 +409,12 @@ export const useConversationHistory = ({
         }
         const controller = streamJsonPatchEntries<PatchType>(url, {
           onEntries(entries) {
+            const existingEntries =
+              displayedExecutionProcesses.current[executionProcess.id]?.entries;
+            if (existingEntries && existingEntries.length > entries.length) {
+              return;
+            }
+
             const patchesWithKey = entries.map((entry, index) =>
               patchWithKey(entry, executionProcess.id, index)
             );
@@ -478,40 +456,45 @@ export const useConversationHistory = ({
     [loadRunningAndEmit]
   );
 
-  const loadAllHistoricEntries = useCallback(async () => {
+  const loadConversationThreadSnapshot = useCallback(async () => {
     const localDisplayedExecutionProcesses: ExecutionProcessStateStore = {};
 
-    if (!executionProcesses?.current) return localDisplayedExecutionProcesses;
+    if (!sessionId) return localDisplayedExecutionProcesses;
 
-    const historicProcesses = executionProcesses.current.filter(
-      (executionProcess) =>
-        executionProcess.status !== ExecutionProcessStatus.running
-    );
+    try {
+      const response = await sessionsApi.getConversation(sessionId);
 
-    const queue = [...historicProcesses];
-    const concurrentLoads = Math.min(HISTORIC_LOAD_CONCURRENCY, queue.length);
-    const workers = Array.from({ length: concurrentLoads }, async () => {
-      while (queue.length > 0) {
-        const executionProcess = queue.pop();
-        if (!executionProcess) return;
+      for (const processEntry of response.processes) {
+        const { execution_process: executionProcess, entries } = processEntry;
 
-        const entries =
-          await loadEntriesForHistoricExecutionProcess(executionProcess);
-        const entriesWithKey = entries.map((e, idx) =>
-          patchWithKey(e, executionProcess.id, idx)
+        if (
+          executionProcess.run_reason !== 'setupscript' &&
+          executionProcess.run_reason !== 'cleanupscript' &&
+          executionProcess.run_reason !== 'codingagent'
+        ) {
+          continue;
+        }
+
+        const entriesWithKey = entries.map((entry, index) =>
+          patchWithKey(entry, executionProcess.id, index)
         );
 
         localDisplayedExecutionProcesses[executionProcess.id] = {
-          executionProcess,
+          executionProcess: {
+            id: executionProcess.id,
+            created_at: executionProcess.created_at,
+            updated_at: executionProcess.updated_at,
+            executor_action: executionProcess.executor_action,
+          },
           entries: entriesWithKey,
         };
       }
-    });
-
-    await Promise.all(workers);
+    } catch (err) {
+      console.warn('Failed to load session conversation snapshot', err);
+    }
 
     return localDisplayedExecutionProcesses;
-  }, [executionProcesses]);
+  }, [patchWithKey, sessionId]);
 
   const ensureProcessVisible = useCallback((p: ExecutionProcess) => {
     mergeIntoDisplayed((state) => {
@@ -543,15 +526,10 @@ export const useConversationHistory = ({
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      // Waiting for execution processes to load
-      if (
-        executionProcesses?.current.length === 0 ||
-        loadedInitialEntries.current
-      )
-        return;
+      if (!sessionId || loadedInitialEntries.current) return;
 
       // Initial entries
-      const allInitialEntries = await loadAllHistoricEntries();
+      const allInitialEntries = await loadConversationThreadSnapshot();
       if (cancelled) return;
       mergeIntoDisplayed((state) => {
         Object.assign(state, allInitialEntries);
@@ -564,10 +542,10 @@ export const useConversationHistory = ({
     };
   }, [
     attempt.id,
-    idListKey,
-    loadAllHistoricEntries,
+    sessionId,
+    loadConversationThreadSnapshot,
     emitEntries,
-  ]); // include idListKey so new processes trigger reload
+  ]);
 
   useEffect(() => {
     const activeProcesses = getActiveAgentProcesses();
